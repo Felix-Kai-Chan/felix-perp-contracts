@@ -4,48 +4,8 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
-
-// ==========================================
-// 1. 数据类型库 
-// ==========================================
-library Types {
-    // 订单结构体
-    struct Order {
-        address maker;      // 订单发起者（也是签名者）
-        address taker;      // 对手方地址 (如果是挂单，可为 address(0))
-        address baseToken;  // 合约标的 (如 BTC)
-        address quoteToken; // 计价货币 (如 USDT)
-        bool isLong;        // true=做多 / false=做空
-        uint256 price;      // 价格
-        uint256 qty;        // 数量
-        uint256 nonce;      // 防重放随机数
-        uint256 expiry;     // 过期时间
-        uint256 feeRate;    // 手续费率
-    }
-
-    // 成交明细
-    struct Fill {
-        uint256 price; // 成交价
-        uint256 qty;   // 成交量
-    }
-
-    // 用户仓位
-    struct Position {
-        int256 size;         // 仓位数量 (正数多单，负数空单)
-        uint256 entryPrice;  // 开仓均价
-        uint256 lastFunding; // 上次结算资金费率时的累积值
-    }
-
-    // 资金费率状态
-    struct FundingState {
-        int256 cumulativeRate; // 累积资金费率
-        uint256 lastUpdate;    // 上次更新时间
-    }
-}
-
-interface IMockOracle {
-    function verifyPrice(uint256 price, uint256 timestamp, bytes memory signature) external view returns (bool);
-}
+import "./Types.sol";
+import "./IMockOracle.sol";
 
 // ==========================================
 // 2. 核心引擎合约
@@ -53,41 +13,37 @@ interface IMockOracle {
 contract FelixPerpDEX is EIP712 {
     // ---------- 权限与核心资产 ----------
     address public owner;
-    address public relayer;      // 链下撮合引擎的打包地址
-    address public escapeKeeper; // 逃生舱/清算机器人
-    address public quoteToken;   // 结算代币 (如 USDT)
-    IMockOracle public oracle;   // 预言机
+    address public relayer;
+    address public escapeKeeper;
+    address public quoteToken;
+    IMockOracle public oracle;
 
     // ---------- 账本 ----------
-    // 记录订单状态: 0=未使用, 2=已成交
     mapping(bytes32 => uint8) public orderStatus;
-    // 用户各币种的仓位: user => baseToken => Position
     mapping(address => mapping(address => Types.Position)) public positions;
-    // 用户余额: user => amount
     mapping(address => uint256) public balances;
+
+    // ===== P0 FIX 1: 新增映射，记录用户参与过的 baseToken =====
+    mapping(address => address[]) public userBases;
+    mapping(address => mapping(address => bool)) public hasBase;
+    // ==========================================================
 
     // ---------- 保险基金 ----------
     uint256 public insuranceFund;
+    uint256 public fundingPool;
 
     // ---------- 参数配置 (均为 1e18 精度) ----------
-    uint256 public constant MAINTENANCE_MARGIN = 5e16; // 维持保证金率 5%
-    uint256 public constant TARGET_MARGIN = 1e17;      // 目标保证金率 10%
-    uint256 public constant LIQUIDATION_FEE = 1e16;     // 清算罚金 1%
-    uint256 public constant KEEPER_SHARE = 5e15;        // 给清算人的赏金 0.5%
+    uint256 public constant MAINTENANCE_MARGIN = 5e16;
+    uint256 public constant TARGET_MARGIN = 1e17;
+    uint256 public constant LIQUIDATION_FEE = 1e16;
+    uint256 public constant KEEPER_SHARE = 5e15;
     uint256 public constant FUNDING_PRECISION = 1e18;
 
     mapping(address => Types.FundingState) public fundingStates;
 
-    // EIP-712 的 TypeHash 声明
     bytes32 private constant ORDER_TYPEHASH = keccak256(
         "Order(address maker,address taker,address baseToken,address quoteToken,bool isLong,uint256 price,uint256 qty,uint256 nonce,uint256 expiry,uint256 feeRate)"
     );
-
-    struct PriceData {
-        uint256 price;
-        uint256 timestamp;
-        bytes signature;
-    }
 
     event Deposit(address indexed user, uint256 amount);
     event Withdraw(address indexed user, uint256 amount);
@@ -115,55 +71,64 @@ contract FelixPerpDEX is EIP712 {
     function withdraw(uint256 amount) external {
         require(amount > 0, "amount must > 0");
         require(balances[msg.sender] >= amount, "insufficient balance");
-        // Checks-Effects-Interactions 模式，防止重入攻击
+
+        // ===== P0 FIX 3: 有未平仓位时禁止提款 =====
+        _requireNoOpenPositions(msg.sender);
+        // ==========================================
+
         balances[msg.sender] -= amount;
         bool success = IERC20(quoteToken).transfer(msg.sender, amount);
         require(success, "transfer failed");
         emit Withdraw(msg.sender, amount);
     }
 
+    function _requireNoOpenPositions(address user) internal view {
+        address[] storage bs = userBases[user];
+        for (uint256 i = 0; i < bs.length; i++) {
+            Types.Position storage p = positions[user][bs[i]];
+            require(p.size == 0, "close positions first");
+        }
+    }
+
     // ==========================================
-    // 4. 仓位更新 (核心数学逻辑)
+    // 4. 仓位更新
     // ==========================================
     function _updatePosition(address user, address base, bool isLong, uint256 price, uint256 qty) internal {
+        // ===== P0 FIX 2: 登记用户参与过的 baseToken =====
+        if (!hasBase[user][base]) {
+            hasBase[user][base] = true;
+            userBases[user].push(base);
+        }
+        // ==============================================
+
         Types.Position storage p = positions[user][base];
         _settleFunding(user, base);
 
         int256 signedQty = isLong ? int256(qty) : -int256(qty);
 
-        // 情况 A: 空仓或者同向加仓 (例如原本就是多单，继续买多)
         if (p.size == 0 || (p.size > 0) == isLong) {
             uint256 oldAbs = p.size >= 0 ? uint256(p.size) : uint256(-p.size);
             uint256 newAbs = oldAbs + qty;
-            // 摊薄开仓均价: (旧均价 * 旧数量 + 新价格 * 新数量) / 总数量
             p.entryPrice = (p.entryPrice * oldAbs + price * qty) / newAbs;
             p.size += signedQty;
-        } 
-        // 情况 B: 反向减仓或反手 (例如原本是多单，现在卖出)
-        else {
+        } else {
             uint256 posAbs = p.size >= 0 ? uint256(p.size) : uint256(-p.size);
 
             if (qty <= posAbs) {
-                // B1: 部分或全部平仓，结算已实现盈亏 (PnL)
                 int256 pnl;
                 if (p.size > 0) {
-                    // 多单平仓: (卖出价 - 开仓价) * 数量
                     pnl = int256(price * qty / 1e18) - int256(p.entryPrice * qty / 1e18);
                 } else {
-                    // 空单平仓: (开仓价 - 买入价) * 数量
                     pnl = int256(p.entryPrice * qty / 1e18) - int256(price * qty / 1e18);
                 }
-                // 更新余额
                 if (pnl > 0) {
                     balances[user] += uint256(pnl);
                 } else {
                     balances[user] -= uint256(-pnl);
                 }
                 p.size += signedQty;
-                if (p.size == 0) p.entryPrice = 0; // 平仓后清空均价
+                if (p.size == 0) p.entryPrice = 0;
             } else {
-                // B2: 穿仓反手 (例如原本有多单 1 个，现在卖空 2 个)
-                // 先结算原有 1 个多单的盈亏
                 int256 pnl;
                 if (p.size > 0) {
                     pnl = int256(price * posAbs / 1e18) - int256(p.entryPrice * posAbs / 1e18);
@@ -173,42 +138,39 @@ contract FelixPerpDEX is EIP712 {
                 if (pnl > 0) balances[user] += uint256(pnl);
                 else balances[user] -= uint256(-pnl);
 
-                // 剩下的数量建立反向新仓位
                 uint256 remainQty = qty - posAbs;
                 p.size = isLong ? int256(remainQty) : -int256(remainQty);
-                p.entryPrice = price; // 新仓位的均价就是当前成交价
+                p.entryPrice = price;
             }
         }
     }
 
     // ==========================================
-    // 5. 清算引擎 (Keeper 触发)
+    // 5. 清算引擎
     // ==========================================
-    function escapeLiquidate(address user, address base, PriceData calldata priceData) external {
+    function escapeLiquidate(address user, address base, Types.PriceData calldata priceData) external {
         require(msg.sender == escapeKeeper || msg.sender == relayer, "only EK or relayer");
         require(oracle.verifyPrice(priceData.price, priceData.timestamp, priceData.signature), "Invalid Oracle Sig");
-        
+
         uint256 currentPrice = priceData.price;
         Types.Position storage p = positions[user][base];
         require(p.size != 0, "no position");
 
         uint256 posAbs = p.size >= 0 ? uint256(p.size) : uint256(-p.size);
         int256 pnl = _calcPnl(p.size, p.entryPrice, posAbs, currentPrice);
-        int256 equity = int256(balances[user]) + pnl; // 账户权益 = 余额 + 未实现盈亏
-        
-        uint256 currentNotional = posAbs * currentPrice / 1e18;
-        if (currentNotional == 0) currentNotional = 1; // 防止除零
+        int256 equity = int256(balances[user]) + pnl;
 
-        // 核心判断：权益 <= 0 或者 保证金率 < 维持保证金率，则允许强平
+        uint256 currentNotional = posAbs * currentPrice / 1e18;
+        if (currentNotional == 0) currentNotional = 1;
+
         require(equity <= 0 || (uint256(equity) * 1e18 / currentNotional < MAINTENANCE_MARGIN), "still safe, cannot liquidate");
 
-        // 如果资不抵债，直接穿仓，由保险基金兜底
         if (equity <= 0) {
             uint256 deficit = uint256(-equity);
             if (insuranceFund >= deficit) {
                 insuranceFund -= deficit;
             } else {
-                insuranceFund = 0; 
+                insuranceFund = 0;
             }
             balances[user] = 0;
             p.size = 0;
@@ -217,8 +179,25 @@ contract FelixPerpDEX is EIP712 {
             return;
         }
 
-        // 部分强平计算
         uint256 liquidateQty = _calcLiquidateQty(posAbs, uint256(equity), currentPrice);
+
+        int256 liqPnl;
+        if (p.size > 0) {
+            liqPnl = int256(currentPrice * liquidateQty / 1e18) - int256(p.entryPrice * liquidateQty / 1e18);
+        } else {
+            liqPnl = int256(p.entryPrice * liquidateQty / 1e18) - int256(currentPrice * liquidateQty / 1e18);
+        }
+        if (liqPnl < 0) {
+            uint256 loss = uint256(-liqPnl);
+            if (balances[user] >= loss) {
+                balances[user] -= loss;
+            } else {
+                balances[user] = 0;
+            }
+        } else {
+            balances[user] += uint256(liqPnl);
+        }
+
         _applyLiquidationPenalty(user, liquidateQty, currentPrice);
 
         if (p.size > 0) {
@@ -239,27 +218,41 @@ contract FelixPerpDEX is EIP712 {
         }
     }
 
+    // ===== P1-1 FIX: 用 TARGET_MARGIN 常量表达，语义清晰 =====
     function _calcLiquidateQty(uint256 posAbs, uint256 equity, uint256 currentPrice) internal pure returns (uint256) {
         if (currentPrice == 0) return posAbs;
-        // 目标保证金率 10%，即权益是名义价值的 10%，反推目标名义价值
-        uint256 targetNotional = equity * 10;
+        // 目标：清算后剩余仓位保证金率 = TARGET_MARGIN（10%）
+        // targetNotional = equity / TARGET_MARGIN = equity * 1e18 / 1e17 = equity * 10
+        uint256 targetNotional = equity * 1e18 / TARGET_MARGIN;
         uint256 targetPosAbs = targetNotional * 1e18 / currentPrice;
         uint256 liquidateQty = posAbs > targetPosAbs ? posAbs - targetPosAbs : posAbs;
+
+        if (liquidateQty == 0 && posAbs > 0) {
+            return posAbs;
+        }
         return liquidateQty > posAbs ? posAbs : liquidateQty;
     }
+    // ======================================================
 
+    // ===== P1-4 FIX: 余额不足时不得凭空给 keeper/保险基金加钱 =====
     function _applyLiquidationPenalty(address user, uint256 liquidateQty, uint256 currentPrice) internal {
         uint256 liquidatedNotional = liquidateQty * currentPrice / 1e18;
         uint256 penalty = liquidatedNotional * LIQUIDATION_FEE / 1e18;
         uint256 keeperReward = liquidatedNotional * KEEPER_SHARE / 1e18;
 
-        balances[user] -= penalty; // 扣除用户罚金
-        balances[msg.sender] += keeperReward; // 给清算人赏金
-        insuranceFund += (penalty - keeperReward); // 剩余进保险基金
+        if (balances[user] >= penalty) {
+            balances[user] -= penalty;
+            balances[msg.sender] += keeperReward;
+            insuranceFund += (penalty - keeperReward);
+        } else {
+            // 用户余额不足：全额没收，不进 keeper/保险基金，避免凭空造币
+            balances[user] = 0;
+        }
     }
+    // ==========================================================
 
     // ==========================================
-    // 6. 撮合结算 (Relayer 调用，核心验签入口)
+    // 6. 撮合结算
     // ==========================================
     function settle(
         Types.Order[] calldata makers,
@@ -270,51 +263,54 @@ contract FelixPerpDEX is EIP712 {
     ) external {
         require(msg.sender == relayer, "only relayer");
         require(makers.length == fills.length, "length mismatch");
+        // ===== P1-3 FIX: taker 数组长度对齐校验 =====
+        require(takers.length == takerSigs.length, "taker arrays mismatch");
+        // ==========================================
 
         for (uint256 i = 0; i < fills.length; i++) {
             Types.Order calldata m = makers[i];
-            
-            // 1. 校验 Maker
+
             require(m.maker != address(0), "invalid maker");
             bytes32 mh = _hashOrder(m);
             require(orderStatus[mh] == 0, "maker order used");
             require(_verifyOrder(m, makerSigs[i]), "bad maker sig");
-            orderStatus[mh] = 2; // 标记已用
+            orderStatus[mh] = 2;
 
-            // 2. 校验 Taker (如果存在)
             if (takers.length > i && takers[i].maker != address(0)) {
                 Types.Order calldata t = takers[i];
-                
-                // 【修复 BUG】：检查是否自成交
+
                 require(m.maker != t.maker, "self trade not allowed");
-                
-                // 【修复 BUG】：检查方向是否相反（一买一卖）
                 require(m.isLong != t.isLong, "maker and taker must be opposite sides");
-                
+
                 bytes32 th = _hashOrder(t);
                 require(orderStatus[th] == 0, "taker order used");
                 require(_verifyOrder(t, takerSigs[i]), "bad taker sig");
                 orderStatus[th] = 2;
-
-                // 更新 Taker 仓位
-                _updatePosition(t.maker, t.baseToken, t.isLong, fills[i].price, fills[i].qty);
-                _isAllSafe(t.maker, t.baseToken);
             }
 
-            // 更新 Maker 仓位
             _updatePosition(m.maker, m.baseToken, m.isLong, fills[i].price, fills[i].qty);
-            _isAllSafe(m.maker, m.baseToken);
+            _isAllSafe(m.maker, m.baseToken, fills[i].price);
+
+            if (takers.length > i && takers[i].maker != address(0)) {
+                Types.Order calldata t = takers[i];
+                _updatePosition(t.maker, t.baseToken, t.isLong, fills[i].price, fills[i].qty);
+                _isAllSafe(t.maker, t.baseToken, fills[i].price);
+            }
         }
     }
 
-    function _isAllSafe(address user, address base) public view {
+    function _isAllSafe(address user, address base, uint256 currentPrice) public view {
         Types.Position storage p = positions[user][base];
         if (p.size == 0) return;
         uint256 posAbs = p.size >= 0 ? uint256(p.size) : uint256(-p.size);
-        uint256 notional = posAbs * p.entryPrice / 1e18; 
+        uint256 notional = posAbs * currentPrice / 1e18;
         if (notional == 0) return;
-        uint256 equity = balances[user];
-        require(equity * 1e18 / notional >= MAINTENANCE_MARGIN, "unsafe position: liquidatable");
+
+        int256 pnl = _calcPnl(p.size, p.entryPrice, posAbs, currentPrice);
+        int256 equity = int256(balances[user]) + pnl;
+
+        require(equity > 0, "account bankrupt");
+        require(uint256(equity) * 1e18 / notional >= MAINTENANCE_MARGIN, "unsafe position: liquidatable");
     }
 
     // ==========================================
@@ -331,7 +327,7 @@ contract FelixPerpDEX is EIP712 {
     function _verifyOrder(Types.Order calldata o, bytes calldata sig) internal view returns (bool) {
         if (block.timestamp > o.expiry) return false;
         bytes32 h = _hashOrder(o);
-        (address recovered, ECDSA.RecoverError err, ) = ECDSA.tryRecover(h, sig);
+        (address recovered, ECDSA.RecoverError err) = ECDSA.tryRecover(h, sig);
         return err == ECDSA.RecoverError.NoError && recovered == o.maker;
     }
 
@@ -350,14 +346,31 @@ contract FelixPerpDEX is EIP712 {
         Types.Position storage p = positions[user][base];
         if (p.size == 0 || fs.lastUpdate == 0) return;
 
-        int256 rateDelta = fs.cumulativeRate - int256(p.lastFunding);
+        // ===== P1-2 FIX: lastFunding 已是 int256，直接相减，不再强转 =====
+        int256 rateDelta = fs.cumulativeRate - p.lastFunding;
         int256 fundingDebt = rateDelta * p.size / 1e18;
 
         if (fundingDebt > 0) {
-            balances[user] -= uint256(fundingDebt);
+            uint256 amount = uint256(fundingDebt);
+            if (balances[user] >= amount) {
+                balances[user] -= amount;
+                fundingPool += amount;
+            } else {
+                fundingPool += balances[user];
+                balances[user] = 0;
+            }
         } else if (fundingDebt < 0) {
-            balances[user] += uint256(-fundingDebt);
+            uint256 amount = uint256(-fundingDebt);
+            if (fundingPool >= amount) {
+                fundingPool -= amount;
+                balances[user] += amount;
+            } else {
+                balances[user] += fundingPool;
+                fundingPool = 0;
+            }
         }
-        p.lastFunding = uint256(fs.cumulativeRate);
+        // ===== P1-2 FIX: 直接赋 int256，不再 uint256() 强转（负数不会 panic）=====
+        p.lastFunding = fs.cumulativeRate;
+        // ======================================================================
     }
 }

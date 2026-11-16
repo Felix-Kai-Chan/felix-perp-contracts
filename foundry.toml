@@ -8,4 +8,39 @@ remappings = [
     "forge-std/=lib/forge-std/src/"
 ]
 
-# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
+# 解决 Stack too deep 的核心配置
+via_ir = true
+optimizer = true
+optimizer_runs = 200
+
+# ===== 新增：fuzz 配置 =====
+[fuzz]
+runs = 1000          # 默认 256，提到 1000 更彻底（CI 可加 --fuzz-runs 覆盖）
+max_test_rejects = 65536
+seed = "0x9dfbacb6f95ca75a699e2f36b620412e318a820f5409e3534d0d40a92d370b06"  # 固定 seed，CI 可复现
+# 说明：本地开发想随机探索时，用 forge test --fuzz-seed random 覆盖
+
+[invariant]
+runs = 256
+depth = 50
+fail_on_revert = true
+
+# ===== 新增：CI profile（forge test --profile ci）=====
+[profile.ci.fuzz]
+runs = 5000          # CI 里跑更多，抓边缘 case
+seed = "0x9dfbacb6f95ca75a699e2f36b620412e318a820f5409e3534d0d40a92d370b06"
+
+[profile.ci.invariant]
+runs = 512
+depth = 100
+fail_on_revert = true
+
+# ===== 新增：格式化配置（forge fmt）=====
+[fmt]
+line_length = 120
+tab_width = 4
+bracket_spacing = true
+int_types = "long"
+quote_style = "double"
+number_underscore = "thousands"
+multiline_func_header = "attributes_first"

@@ -21,3 +21,4 @@ docs/
 out/
 cache/
 lib/
+lcov.info
