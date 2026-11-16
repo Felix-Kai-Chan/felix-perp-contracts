@@ -22,3 +22,4 @@ out/
 cache/
 lib/
 lcov.info
+anvil-state.json
