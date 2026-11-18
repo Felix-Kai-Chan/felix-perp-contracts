@@ -7,6 +7,9 @@ import {MockERC20} from "../src/MockERC20.sol";
 import {MockOracle} from "../src/MockOracle.sol";
 
 contract DeployScript is Script {
+    // ===== 固定 CREATE2 salt，一旦确定就不要再改 =====
+    bytes32 public constant DEX_SALT = bytes32(0);
+
     function run() external {
         // ===== 1. 读环境变量 =====
         uint256 deployerPk = vm.envUint("PRIVATE_KEY");
@@ -47,8 +50,8 @@ contract DeployScript is Script {
             console.log("oracle:", oracleAddr);
         }
 
-        // ===== 2. 部署 FelixPerpDEX =====
-        FelixPerpDEX dex = new FelixPerpDEX(
+        // ===== 2. 用 CREATE2 部署 FelixPerpDEX（固定地址）=====
+        FelixPerpDEX dex = new FelixPerpDEX{salt: DEX_SALT}(
             relayer,
             keeper,
             quoteToken,
@@ -57,7 +60,7 @@ contract DeployScript is Script {
 
         console.log("FelixPerpDEX:", address(dex));
 
-        // ===== 3. 本地部署：给测试账户 mint + approve =====
+        // ===== 3. 本地部署：给测试账户 mint =====
         if (isLocal) {
             _setupLocalAccounts(FelixPerpDEX(dex), quoteToken);
         }
@@ -74,13 +77,13 @@ contract DeployScript is Script {
 
         if (isLocal) {
             console.log("\n=== Next steps ===");
-            console.log("1. Save the addresses above to .env");
+            console.log("1. Copy DEX_ADDR to .env in both contracts/ and engine/");
             console.log("2. Run tests: forge test");
             console.log("3. Interact: cast call <dex> 'balances(address)' <user> --rpc-url http://localhost:8545");
         }
     }
 
-    /// @notice 本地部署后，给 anvil 默认账户 mint 测试 USDT + approve
+    /// @notice 本地部署后，给 anvil 默认账户 mint 测试 USDT
     function _setupLocalAccounts(FelixPerpDEX dex, address usdtAddr) internal {
         MockERC20 usdt = MockERC20(usdtAddr);
 
@@ -95,9 +98,6 @@ contract DeployScript is Script {
 
         for (uint256 i = 0; i < users.length; i++) {
             usdt.mint(users[i], 1_000_000e18);
-            // 注意：approve 需要用户自己调用，这里用 vm.prank 模拟
-            // 但在 broadcast 模式下 vm.prank 不生效，所以这里只 mint
-            // 实际 approve 由测试或前端调
         }
 
         console.log("Minted 1,000,000 USDT to 5 anvil accounts");
