@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
@@ -48,6 +49,7 @@ contract FelixPerpDEX is EIP712 {
     event Deposit(address indexed user, uint256 amount);
     event Withdraw(address indexed user, uint256 amount);
     event Liquidated(address indexed user, uint256 liquidatedQty, uint256 penalty, uint256 keeperReward);
+    event Cancelled(bytes32 indexed orderHash, address indexed maker);
 
     constructor(address _relayer, address _ek, address _quoteToken, address _oracleAddress) EIP712("FelixPerpDEX", "1") {
         owner = msg.sender;
@@ -297,6 +299,21 @@ contract FelixPerpDEX is EIP712 {
                 _isAllSafe(t.maker, t.baseToken, fills[i].price);
             }
         }
+    }
+
+    // ==========================================
+    // 6.5 撤单（纯新增，settle 本体零改动）
+    // ==========================================
+    // orderStatus 取值约定：0 = 未使用 / 2 = 已被撮合 / 3 = 已撤单(本函数写入)
+    // settle 原本就有 require(orderStatus[mh] == 0, "maker order used")
+    //            和      require(orderStatus[th] == 0, "taker order used")
+    // 所以 status 一旦置为 3，这张订单在 maker 侧与 taker 侧都永久无法再被结算。
+    function cancelOrder(Types.Order calldata o) external {
+        require(o.maker == msg.sender, "only maker can cancel");
+        bytes32 h = _hashOrder(o);
+        require(orderStatus[h] == 0, "order used");
+        orderStatus[h] = 3;
+        emit Cancelled(h, o.maker);
     }
 
     function _isAllSafe(address user, address base, uint256 currentPrice) public view {

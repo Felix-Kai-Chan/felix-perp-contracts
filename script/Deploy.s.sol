@@ -8,7 +8,13 @@ import {MockOracle} from "../src/MockOracle.sol";
 
 contract DeployScript is Script {
     // ===== 固定 CREATE2 salt，一旦确定就不要再改 =====
-    bytes32 public constant DEX_SALT = bytes32(0);
+    bytes32 public constant DEX_SALT    = bytes32(0);
+    // ===== 新增：Mock 也必须用固定 salt =====
+    // 否则本地重部署时 Mock 地址随 deployer nonce 漂移 -> DEX 构造参数变
+    // -> initcode 变 -> 即使 DEX_SALT 固定，DEX 地址照样变
+    bytes32 public constant USDT_SALT   = bytes32(uint256(1));
+    bytes32 public constant ORACLE_SALT = bytes32(uint256(2));
+    // =================================================
 
     function run() external {
         // ===== 1. 读环境变量 =====
@@ -29,8 +35,8 @@ contract DeployScript is Script {
             address signer = vm.envAddress("ORACLE_SIGNER");
             uint256 maxPriceAge = vm.envOr("MAX_PRICE_AGE", uint256(3600));
 
-            MockERC20 usdt = new MockERC20();
-            MockOracle oracle = new MockOracle(signer, maxPriceAge);
+            MockERC20 usdt = new MockERC20{salt: USDT_SALT}();
+            MockOracle oracle = new MockOracle{salt: ORACLE_SALT}(signer, maxPriceAge);
 
             quoteToken = address(usdt);
             oracleAddr = address(oracle);

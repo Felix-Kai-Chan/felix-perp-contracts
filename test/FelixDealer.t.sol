@@ -510,4 +510,108 @@ contract FelixPerpDEXTest is Test {
         assertEq(aA, 0, "baseA should be liquidated");
         assertEq(aB, int256(2 * ONE), "baseB should be unaffected");   // ← 关键断言
     }
+
+    // ==========================================
+    // K. 撤单：cancelOrder 正确性 + 撤单后 settle 必须失效
+    // ==========================================
+    function test_Cancel() public {
+        address base = makeAddr("base");
+        vm.prank(alice); dex.deposit(100_000 * ONE);
+        vm.prank(bob);   dex.deposit(100_000 * ONE);
+
+        uint256 price = 50_000 * ONE;
+        uint256 qty   = 1 * ONE;
+        uint256 nM = nonceCounter++;
+        uint256 expM = block.timestamp + 3600;
+        uint256 nT = nonceCounter++;
+        uint256 expT = block.timestamp + 3600;
+
+        Types.Order memory m = Types.Order(alice, bob, base, address(usdt), true, price, qty, nM, expM, 0);
+        bytes memory mSig = _signOrder(alice, bob, base, true, price, qty, nM, expM, 0);
+
+        bytes32 h = dex._hashOrder(m);
+        assertEq(dex.orderStatus(h), 0, "fresh order should be unused");
+
+        // 1. 非 maker 不能撤（taker 也不行）
+        vm.prank(bob);
+        vm.expectRevert("only maker can cancel");
+        dex.cancelOrder(m);
+        assertEq(dex.orderStatus(h), 0, "status must stay 0 after failed cancel");
+
+        // 2. maker 撤单成功：status 置 3，事件发出
+        vm.prank(alice);
+        vm.expectEmit(true, true, false, false, address(dex));
+        emit FelixPerpDEX.Cancelled(h, alice);
+        dex.cancelOrder(m);
+        assertEq(dex.orderStatus(h), 3, "status should be cancelled(3)");
+
+        // 3. 撤单后 settle 必须 revert —— settle 本体没改，靠原本那句 require(status==0) 拦住
+        Types.Order[] memory makers = new Types.Order[](1);
+        Types.Order[] memory takers = new Types.Order[](1);
+        bytes[] memory msigs = new bytes[](1);
+        bytes[] memory tsigs = new bytes[](1);
+        Types.Fill[] memory fills = new Types.Fill[](1);
+
+        makers[0] = m;
+        msigs[0]  = mSig;
+        takers[0] = Types.Order(bob, address(0), base, address(usdt), false, price, qty, nT, expT, 0);
+        tsigs[0]  = _signOrder(bob, address(0), base, false, price, qty, nT, expT, 0);
+        fills[0]  = Types.Fill(price, qty);
+
+        vm.prank(relayer);
+        vm.expectRevert("maker order used");
+        dex.settle(makers, msigs, takers, tsigs, fills);
+
+        // 仓位与余额都没被动过
+        (int256 size,,) = dex.positions(alice, base);
+        assertEq(size, 0, "cancelled order must not open any position");
+        assertEq(dex.balances(alice), 100_000 * ONE, "balance must be untouched");
+
+        // 4. 重复撤单 revert
+        vm.prank(alice);
+        vm.expectRevert("order used");
+        dex.cancelOrder(m);
+    }
+
+    // 撤单后换 nonce 重签一张新单，仍可正常撮合
+    function test_Cancel_Then_NewOrder_Settles() public {
+        address base = makeAddr("base");
+        vm.prank(alice); dex.deposit(100_000 * ONE);
+        vm.prank(bob);   dex.deposit(100_000 * ONE);
+
+        uint256 price = 50_000 * ONE;
+        uint256 qty   = 1 * ONE;
+
+        uint256 n0 = nonceCounter++;
+        Types.Order memory dead = Types.Order(alice, bob, base, address(usdt), true, price, qty, n0, block.timestamp + 3600, 0);
+        vm.prank(alice); dex.cancelOrder(dead);
+        assertEq(dex.orderStatus(dex._hashOrder(dead)), 3);
+
+        _openPair(base, alice, bob, true, price, qty);
+        (int256 size,,) = dex.positions(alice, base);
+        assertEq(size, int256(qty), "new order after cancel should settle normally");
+    }
+
+    // 已被撮合(status=2)的订单不能再去撤
+    function test_Cancel_AfterFill_Reverts() public {
+        address base = makeAddr("base");
+        vm.prank(alice); dex.deposit(100_000 * ONE);
+        vm.prank(bob);   dex.deposit(100_000 * ONE);
+
+        uint256 price = 50_000 * ONE;
+        uint256 qty   = 1 * ONE;
+        uint256 n = nonceCounter;
+        uint256 exp = block.timestamp + 3600;
+
+        _openPair(base, alice, bob, true, price, qty);
+
+        // 复原那张已被撮合的 maker 单（_openPair 里 makers[0] 用的就是当时的 nonceCounter）
+        Types.Order memory filled = Types.Order(alice, bob, base, address(usdt), true, price, qty, n, exp, 0);
+        bytes32 h = dex._hashOrder(filled);
+        assertEq(dex.orderStatus(h), 2, "should already be filled(2)");
+
+        vm.prank(alice);
+        vm.expectRevert("order used");
+        dex.cancelOrder(filled);
+    }
 }
