@@ -44,7 +44,8 @@ contract LedgerInvariantTest is Test {
         vm.startPrank(owner);
         usdt   = new MockERC20();
         oracle = new MockOracle(signer, 3600);
-        dex    = new FelixPerpDEX(relayer, keeper, address(usdt), address(oracle));
+        markOracle = new MarkPriceOracle();
+        dex    = new FelixPerpDEX(relayer, keeper, address(usdt), address(oracle), address(markOracle));
         vm.stopPrank();
 
         users.push(alice);

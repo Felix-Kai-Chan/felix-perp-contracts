@@ -48,7 +48,8 @@ contract FelixPerpDEXTest is Test {
         vm.startPrank(owner);
         usdt   = new MockERC20();
         oracle = new MockOracle(priceSigner, 3600);
-        dex    = new FelixPerpDEX(relayer, keeper, address(usdt), address(oracle));
+        markOracle = new MarkPriceOracle();
+        dex    = new FelixPerpDEX(relayer, keeper, address(usdt), address(oracle), address(markOracle));
         vm.stopPrank();
 
         address[3] memory users = [alice, bob, carol];
