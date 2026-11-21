@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+
+
 /// @title IMarkPriceOracle - 标记价格预言机接口
 interface IMarkPriceOracle {
     function getMarkPrice() external view returns (uint256);

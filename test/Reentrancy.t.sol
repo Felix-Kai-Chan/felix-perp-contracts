@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {FelixPerpDEX} from "../src/FelixDealer.sol";
 import {MockOracle} from "../src/MockOracle.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {MarkPriceOracle} from "../src/MarkPriceOracle.sol";
 
 /// @notice 恶意 ERC20：transfer 时回调 dex.withdraw，试图重入
 contract MaliciousToken is ERC20 {
@@ -43,6 +44,7 @@ contract ReentrancyTest is Test {
     FelixPerpDEX dex;
     MockOracle oracle;
     MaliciousToken malToken;
+    MarkPriceOracle markOracle;
 
     uint256 constant PK_RELAYER = 0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d;
     uint256 constant PK_KEEPER  = 0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a;

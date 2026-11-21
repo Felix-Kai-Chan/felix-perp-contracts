@@ -6,10 +6,12 @@ import {FelixPerpDEX} from "../src/FelixDealer.sol";
 import {Types} from "../src/Types.sol";
 import {MockOracle} from "../src/MockOracle.sol";
 import {MockERC20} from "../src/MockERC20.sol";
+import {MarkPriceOracle} from "../src/MarkPriceOracle.sol"; 
 
 contract FelixPerpDEXTest is Test {
     FelixPerpDEX dex;
     MockOracle oracle;
+     MarkPriceOracle markOracle;
     MockERC20 usdt;
 
     uint256 constant PK_OWNER   = 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80;
@@ -615,4 +617,93 @@ contract FelixPerpDEXTest is Test {
         vm.expectRevert("order used");
         dex.cancelOrder(filled);
     }
+
+    // ============================================================
+    //  补充：分支覆盖（本轮新增，全部基于已确认的 require 文本/已知 API）
+    //  这些测试只打你源码里明确存在的 revert 分支，不依赖未知常量
+    // ============================================================
+
+    // setMarkOracle：仅 owner 可调，且地址非零
+    function test_SetMarkOracle_AccessControl() public {
+        address newOracle = makeAddr("newOracle");
+        // 非 owner -> only owner
+        vm.prank(alice);
+        vm.expectRevert("only owner");
+        dex.setMarkOracle(newOracle);
+        // owner 传零地址 -> zero addr
+        vm.prank(owner);
+        vm.expectRevert("zero addr");
+        dex.setMarkOracle(address(0));
+        // owner 传有效地址 -> 成功，不 revert
+        vm.prank(owner);
+        dex.setMarkOracle(newOracle);
+    }
+
+    // 有未平仓位时禁止 withdraw -> close positions first
+    function test_Withdraw_ClosePositionsFirst() public {
+        address base = makeAddr("base");
+        vm.prank(alice); dex.deposit(100_000 * ONE);
+        vm.prank(bob);   dex.deposit(100_000 * ONE);
+        _openPair(base, alice, bob, true, 50_000 * ONE, 1 * ONE);
+
+        vm.prank(alice);
+        vm.expectRevert("close positions first");
+        dex.withdraw(1 * ONE);
+    }
+
+    // 对无仓位者清算 -> no position
+    // markOracle 在 setUp 里刚 new 出来未初始化 -> mkValid=false 跳过偏离检查，直达 size!=0 校验
+    function test_Liquidate_NoPosition() public {
+        address base = makeAddr("base");
+        uint256 price = 50_000 * ONE;
+        Types.PriceData memory pd = Types.PriceData({
+            price: price, timestamp: block.timestamp, signature: _signPrice(price, block.timestamp)
+        });
+        vm.prank(keeper);
+        vm.expectRevert("no position");
+        dex.escapeLiquidate(alice, base, pd);
+    }
+
+    // 仓位安全时不能清算 -> stillsafe, cannot liquidate
+    function test_Liquidate_StillSafe() public {
+        address base = makeAddr("base");
+        vm.prank(alice); dex.deposit(100_000 * ONE);
+        vm.prank(bob);   dex.deposit(100_000 * ONE);
+        _openPair(base, alice, bob, true, 50_000 * ONE, 1 * ONE);
+
+        // 平价喂价，equity 远超维持保证金
+        uint256 price = 50_000 * ONE;
+        Types.PriceData memory pd = Types.PriceData({
+            price: price, timestamp: block.timestamp, signature: _signPrice(price, block.timestamp)
+        });
+        vm.prank(keeper);
+        vm.expectRevert("stillsafe, cannot liquidate");
+        dex.escapeLiquidate(alice, base, pd);
+    }
+
+    // 错误的预言机签名 -> Invalid Oracle Sig
+    function test_Liquidate_BadOracleSig() public {
+        address base = makeAddr("base");
+        uint256 price = 50_000 * ONE;
+        // 故意用错误私钥(PK_ALICE)签价，priceSigner 校验失败
+        bytes32 inner = keccak256(abi.encodePacked(price, block.timestamp));
+        bytes32 digest = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", inner));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(PK_ALICE, digest);
+        bytes memory badSig = abi.encodePacked(r, s, v);
+        Types.PriceData memory pd = Types.PriceData({
+            price: price, timestamp: block.timestamp, signature: badSig
+        });
+        vm.prank(keeper);
+        vm.expectRevert("Invalid Oracle Sig");
+        dex.escapeLiquidate(alice, base, pd);
+    }
+
+    // 未授权/无余额用户 deposit -> transfer 失败（空 expectRevert，兼容 revert 或返回 false 两种 mock 行为）
+    function test_Deposit_TransferFailed() public {
+        address stranger = makeAddr("stranger");
+        vm.prank(stranger);
+        vm.expectRevert();
+        dex.deposit(1 * ONE);
+    }
+
 }

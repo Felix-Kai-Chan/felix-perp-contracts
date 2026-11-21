@@ -6,12 +6,16 @@ import {FelixPerpDEX} from "../src/FelixDealer.sol";
 import {Types} from "../src/Types.sol";
 import {MockOracle} from "../src/MockOracle.sol";
 import {MockERC20} from "../src/MockERC20.sol";
+import {MarkPriceOracle} from "../src/MarkPriceOracle.sol";
+import {MarkPriceOracle} from "../src/MarkPriceOracle.sol";
+import {MarkPriceOracle} from "../src/MarkPriceOracle.sol";
 import {FelixHandler} from "./handlers/FelixHandler.sol";
 
 contract LedgerInvariantTest is Test {
     FelixPerpDEX dex;
     MockOracle oracle;
     MockERC20 usdt;
+    MarkPriceOracle markOracle;
     FelixHandler handler;
 
     uint256 constant PK_RELAYER = 0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d;
@@ -90,10 +94,4 @@ contract LedgerInvariantTest is Test {
             "contract insolvent vs pools"
         );
     }
-
-    // 注意：invariant_PositionNetZero 已删除。
-    // 原因：本合约是订单簿模式，清算时不强制平对手方仓位，
-    // 多空不可能时刻对冲（对手方会变成裸仓，等待其他用户/AMM 接盘）。
-    // 多 base 隔离已由 invariant_LedgerConserved 隐含覆盖：
-    // 若 baseA 的 PnL 串到 baseB，总账会膨胀，LedgerConserved 会 FAIL。
 }
